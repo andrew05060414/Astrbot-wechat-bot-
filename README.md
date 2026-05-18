@@ -89,6 +89,17 @@ API_KEY = "your_astrobot_api_key_here"                # AstrBot API 密钥
 BOT_NICKNAMES = ["你的微信昵称"]                       # 机器人微信昵称（群聊 @ 检测用）
 ```
 
+### 总结版
+1.装好依赖（astrbot+内置所需的api本地模型等+python+所有库...）
+2.下载项目文件（clone 或直接下载 zip）（全部拖到桌面就行）
+3.改 bridge.py 三个配置项：
+  API_KEY ← 你自己的 AstrBot 密钥
+  BOT_NICKNAMES ← 你自己的微信昵称
+  ASTRBOT_URL ← 你自己的 AstrBot 地址（端口可能不一样）
+4.打开：python bridge.py 或 start_bot.bat
+5.访问上面显示的 http://127.0.0.1:8765（反正现实的web）
+6.点 "启动" 就开始跑了
+
 ## 使用
 
 ### 微信版本补丁（每次重启微信后必做）
@@ -154,6 +165,11 @@ stop_bot.bat
 3. 被 @ → 同私聊流程，session_id 使用 `wx_group_群名_发送者昵称`
 
 ## 技术要点
+
+### wxauto
+由于wxauto库使用，必然会产生和你抢鼠标键盘/抢焦点情况，目前已经设置了仅在→收到消息→去查看→进行回复 的时候才会占用
+
+也可以配置虚拟机实现，但由于作者有点懒故而...（ciallo！
 
 ### DirectUI 发送机制
 

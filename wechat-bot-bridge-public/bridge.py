@@ -13,6 +13,42 @@ from wxauto import WeChat
 import requests
 import win32gui, win32con, win32process, win32api
 
+# ============ 持久化配置 ============
+ACL_FILE = "acl.json"  # {"mode": "whitelist"|"blacklist", "wxids": ["wxid_xxx", ...]}
+CONTACTS_FILE = "contacts.json"  # 好友列表持久化存储
+
+def load_acl() -> dict:
+    """加载黑白名单配置，默认黑名单模式且为空"""
+    default = {"mode": "blacklist", "wxids": []}
+    if not os.path.exists(ACL_FILE):
+        save_acl(default)
+        return default
+    try:
+        with open(ACL_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if "mode" not in data or "wxids" not in data:
+            return default
+        return data
+    except Exception:
+        return default
+
+def save_acl(data: dict) -> None:
+    with open(ACL_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def is_wxid_allowed(wxid: str) -> bool:
+    """根据当前黑白名单模式判断该微信号是否允许交互"""
+    if not wxid:
+        return False
+    acl = load_acl()
+    mode = acl.get("mode", "blacklist")
+    wxids = set(acl.get("wxids", []))
+    if mode == "whitelist":
+        return wxid in wxids
+    else:  # blacklist
+        return wxid not in wxids
+# ======================================
+
 
 def _activate_wechat_foreground(hwnd):
     """使用 AttachThreadInput 可靠激活微信窗口到前台"""
@@ -77,8 +113,50 @@ nick_map = {}  # 微信号 → 原始昵称
 _seen_msg_ids = {}  # {chat_name: {msg_content, ...}}，同聊天同内容永久去重
 
 
+CONTACT_CACHE_FILE = "contacts_cache.json"
+
+
+def _load_contact_cache():
+    """从缓存文件加载好友映射"""
+    if not os.path.exists(CONTACT_CACHE_FILE):
+        return {}, {}
+    try:
+        with open(CONTACT_CACHE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("name_to_wxid", {}), data.get("wxid_to_nick", {})
+    except Exception as e:
+        log.warning(f"读取好友缓存失败: {e}")
+        return {}, {}
+
+
+def _save_contact_cache(name_to_wxid, wxid_to_nick):
+    """将好友映射持久化到缓存文件"""
+    try:
+        with open(CONTACT_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"name_to_wxid": name_to_wxid, "wxid_to_nick": wxid_to_nick},
+                      f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.warning(f"保存好友缓存失败: {e}")
+
+
 def build_contact_map(wx):
-    """从微信读取好友列表，构建 昵称→微信号 和 微信号→原始昵称 映射"""
+    """从微信读取好友列表，构建 昵称→微信号 和 微信号→原始昵称 映射，并持久化缓存"""
+    # 如果存在缓存文件，询问用户是否需要重新遍历
+    if os.path.exists(CONTACT_CACHE_FILE):
+        try:
+            cached_name, cached_wxid = _load_contact_cache()
+            cache_count = len(cached_wxid)
+            if cache_count > 0:
+                print(f"\n检测到好友缓存文件 ({CONTACT_CACHE_FILE})，包含 {cache_count} 位联系人。")
+                choice = input("是否跳过遍历直接使用缓存？(Y/n): ").strip().lower()
+                if choice in ("", "y", "yes"):
+                    log.info(f"用户选择使用缓存，已加载 {cache_count} 位联系人")
+                    return cached_name, cached_wxid
+                else:
+                    log.info("用户选择重新遍历好友列表")
+        except Exception as e:
+            log.warning(f"读取缓存用于提示时出错: {e}，将继续遍历")
+
     try:
         details = wx.GetFriendDetails()
         name_to_wxid = {}
@@ -96,10 +174,15 @@ def build_contact_map(wx):
         # 自身也记一下
         name_to_wxid[wx.nickname] = "self"
         wxid_to_nick["self"] = wx.nickname
-        log.info(f"好友列表加载完成，共 {len(details)} 人")
+        _save_contact_cache(name_to_wxid, wxid_to_nick)
+        log.info(f"好友列表加载完成，共 {len(details)} 人，已缓存至 {CONTACT_CACHE_FILE}")
         return name_to_wxid, wxid_to_nick
     except Exception as e:
-        log.error(f"获取好友列表失败: {e}")
+        log.error(f"获取好友列表失败: {e}，尝试使用缓存")
+        cached_name, cached_wxid = _load_contact_cache()
+        if cached_name and cached_wxid:
+            log.info(f"已从缓存恢复好友列表，共 {len(cached_wxid)} 人")
+            return cached_name, cached_wxid
         return {}, {}
 
 
@@ -255,6 +338,22 @@ def handle_message(wx: WeChat, chat_name: str, msg) -> None:
 
     if msg_type in ("sys", "self"):
         return
+
+    # === 黑白名单过滤（基于微信号） ===
+    target_wxid = None
+    sender_display = ensure_str(getattr(msg, "sender", ""))
+    is_group_check = bool(sender_display) and sender_display != chat_name
+    if is_group_check:
+        # 群聊：尝试从 wxid_map 反查发言者的微信号
+        target_wxid = wxid_map.get(sender_display, "")
+    else:
+        # 私聊：chat_name 可能是昵称或微信号
+        target_wxid = wxid_map.get(chat_name, chat_name)
+
+    if not is_wxid_allowed(target_wxid):
+        log.info(f"[ACL] 拒绝: {target_wxid or chat_name} (不在允许列表中)")
+        return
+    # ====================================
 
     # wxauto 群聊消息会携带 sender 属性（发言者在群内的昵称）
     sender = ensure_str(getattr(msg, "sender", ""))
@@ -563,10 +662,13 @@ setInterval(refresh, 3000);
 class WebHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/status":
+            acl = load_acl()
             self.send_json({
                 "running": running,
                 "paused": paused.is_set(),
                 "log": open("bridge.log", encoding="utf-8", errors="replace").read().splitlines()[-10:] if running else [],
+                "acl_mode": acl.get("mode", "blacklist"),
+                "acl_wxids": acl.get("wxids", []),
             })
         else:
             self.send_response(200)
@@ -589,6 +691,41 @@ class WebHandler(BaseHTTPRequestHandler):
             paused.clear()
             log.info("[Web] 已恢复")
             self.send_json({"ok": True})
+        elif self.path == "/acl/set_mode":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+            mode = body.get("mode", "blacklist")
+            if mode not in ("whitelist", "blacklist"):
+                self.send_json({"ok": False, "error": "invalid mode"}, 400)
+            else:
+                acl = load_acl()
+                acl["mode"] = mode
+                save_acl(acl)
+                log.info(f"[Web] ACL 模式切换为 {mode}")
+                self.send_json({"ok": True, "acl": acl})
+        elif self.path == "/acl/add":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+            wxid = body.get("wxid", "").strip()
+            if not wxid:
+                self.send_json({"ok": False, "error": "wxid required"}, 400)
+            else:
+                acl = load_acl()
+                if wxid not in acl["wxids"]:
+                    acl["wxids"].append(wxid)
+                    save_acl(acl)
+                    log.info(f"[Web] ACL 添加: {wxid}")
+                self.send_json({"ok": True, "acl": acl})
+        elif self.path == "/acl/remove":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+            wxid = body.get("wxid", "").strip()
+            acl = load_acl()
+            if wxid in acl["wxids"]:
+                acl["wxids"].remove(wxid)
+                save_acl(acl)
+                log.info(f"[Web] ACL 移除: {wxid}")
+            self.send_json({"ok": True, "acl": acl})
         else:
             self.send_json({"ok": False}, 404)
 
